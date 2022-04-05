@@ -49,7 +49,15 @@ func newDir(parent *Dir, dirPath string, entries fs.DirEntries, err error) *Dir 
 	for _, entry := range entries {
 		if o, ok := entry.(fs.Object); ok {
 			d.count++
-			d.size += o.Size()
+			s := o.Size()
+			if s < 0 {
+				// Some backends do not provide object size and simply return -1,
+				// and in any case if a negative object size is reported we don't
+				// want to use the sum and instead set predefined value -1 as dir size.
+				d.size = -1
+				break
+			}
+			d.size += s
 		}
 	}
 	// Set my directory entry in parent
