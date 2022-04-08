@@ -22,7 +22,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if _, ok := f.dirMap.Path[remote]; ok {
 		return nil, fs.ErrorIsDir
 	}
-	_, base := path.Split(remote)
+	base := path.Base(remote)
 	entry, fileHash, ok := f.toHash(remote)
 	if !ok {
 		return nil, fs.ErrorObjectNotFound
@@ -35,17 +35,45 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 	basePath := path.Join(entry.Hash, fileHash)
-	obj, err := f.base.NewObject(ctx, path.Join(basePath, "data"))
+	dataObj, err := f.base.NewObject(ctx, path.Join(basePath, "data"))
 	if err != nil {
 		return nil, fmt.Errorf("error fetching base object: %w", err)
 	}
 	return object{
-		obj:      obj,
+		obj:      dataObj,
 		path:     remote,
 		basePath: basePath,
 		fs:       f,
 		dirEntry: entry,
 	}, nil
+}
+
+// OpenWriterAt opens a handle for random access writes.
+func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.WriterAtCloser, error) {
+	do := f.base.Features().OpenWriterAt
+	if do == nil {
+		return nil, fs.ErrorNotImplemented
+	}
+	remote = path.Join(f.root, remote)
+	dir, base := path.Split(remote)
+	dir = strings.TrimSuffix(dir, "/")
+	if err := f.Mkdir(ctx, dir); err != nil {
+		return nil, fmt.Errorf("error creating parent directory: %w", err)
+	}
+	entry, fileHash, ok := f.toHash(remote)
+	if !ok {
+		panic("parent directory does not exist")
+	}
+	files, err := entry.Files(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refusing to edit files in directory with corrupted map file: %w", err)
+	}
+	if _, ok := files[base]; !ok {
+		if err := f.prepareDest(ctx, nil, remote, entry.Hash, fileHash); err != nil {
+			return nil, err
+		}
+	}
+	return do(ctx, path.Join(entry.Hash, fileHash, "data"), size)
 }
 
 // Put puts in to the remote path with the modTime given of the given size.
@@ -83,13 +111,73 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !ok {
 		return nil, fs.ErrorDirNotFound
 	}
-	if err := f.prepareDest(ctx, src, src.Remote(), entry.Hash, fileHash); err != nil {
+	if err := f.prepareDest(ctx, src, remote, entry.Hash, fileHash); err != nil {
+		return nil, err
+	}
+	base := path.Base(remote)
+	if err := entry.addFile(ctx, base, fileHash); err != nil {
 		return nil, err
 	}
 	if err := entry.write(ctx); err != nil {
 		return nil, err
 	}
 	return do(ctx, src.(object).UnWrap(), path.Join(entry.Hash, fileHash, "data"))
+}
+
+// Move moves the specified file to the specified path.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	do := f.base.Features().Move
+	if do == nil {
+		return nil, fs.ErrorCantMove
+	}
+	if strings.Contains(remote, "\n") {
+		return nil, fmt.Errorf("file name may not contain newline: %q", src.Remote())
+	}
+	// Modify destination entry.
+	entry, fileHash, ok := f.toHash(remote)
+	if !ok {
+		return nil, fs.ErrorDirNotFound
+	}
+	if err := f.prepareDest(ctx, src, remote, entry.Hash, fileHash); err != nil {
+		return nil, err
+	}
+	base := path.Base(remote)
+	if err := entry.addFile(ctx, base, fileHash); err != nil {
+		return nil, err
+	}
+	if err := entry.write(ctx); err != nil {
+		return nil, err
+	}
+	// Modify source entry.
+	srcBase := path.Base(src.Remote())
+	srcEntry, srcHash, ok := f.toHash(src.Remote())
+	if !ok {
+		return nil, fs.ErrorDirNotFound
+	}
+	if err := srcEntry.removeFile(ctx, srcBase); err != nil {
+		return nil, err
+	}
+	if err := srcEntry.write(ctx); err != nil {
+		return nil, err
+	}
+	// Move data file.
+	obj, objErr := do(ctx, src.(object).UnWrap(), path.Join(entry.Hash, fileHash, "data"))
+	if obj != nil {
+		// Always wrap the object returned.
+		obj = object{
+			obj:      obj,
+			path:     remote,
+			basePath: path.Join(entry.Hash, fileHash),
+			fs:       f,
+			dirEntry: entry,
+		}
+	}
+	// Remove source directory, including name metadata.
+	if err := operations.Purge(ctx, f.base, path.Join(srcEntry.Hash, srcHash)); err != nil {
+		fs.LogPrintf(fs.LogLevelWarning, src, "error purging old location")
+		return obj, err
+	}
+	return obj, objErr
 }
 
 type putFn func(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOption) (fs.Object, error)
@@ -138,7 +226,7 @@ func (f *Fs) put(ctx context.Context, do putFn, in io.Reader, src fs.ObjectInfo,
 
 // prepareDest is a helper function that creates the directory structure for a
 // given file creation. It does not create the "data" file.
-func (f *Fs) prepareDest(ctx context.Context, src fs.ObjectInfo, overlay, dirHash, fileHash string) error {
+func (f *Fs) prepareDest(ctx context.Context, src fs.ObjectInfo, destOverlay, dirHash, fileHash string) error {
 	// Create the directory for the file.
 	err := f.base.Mkdir(ctx, dirHash)
 	if err != nil {
@@ -153,9 +241,9 @@ func (f *Fs) prepareDest(ctx context.Context, src fs.ObjectInfo, overlay, dirHas
 		objInfo: src,
 		remote:  path.Join(dirHash, fileHash, "name"),
 		fs:      f,
-		size:    int64(len(overlay) + 1),
+		size:    int64(len(destOverlay) + 1),
 	}
-	_, err = f.base.Put(ctx, strings.NewReader(overlay+"\n"), nameSrc)
+	_, err = f.base.Put(ctx, strings.NewReader(destOverlay+"\n"), nameSrc)
 	if err != nil {
 		return fmt.Errorf("error creating name file: %w", err)
 	}
@@ -163,10 +251,7 @@ func (f *Fs) prepareDest(ctx context.Context, src fs.ObjectInfo, overlay, dirHas
 }
 
 var (
-	// TODO:
-	// var _ fs.FullObject = object{}
-	_ fs.Object     = object{}
-	_ fs.MimeTyper  = object{}
+	_ fs.FullObject = object{}
 	_ fs.ObjectInfo = fakeObjInfo{}
 )
 
@@ -255,11 +340,10 @@ func (o object) Remove(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	files, err := o.dirEntry.Files(ctx)
-	if err != nil {
-		return fmt.Errorf("refusing to modify map file: cannot load map file: %w", err)
+	base := path.Base(o.path)
+	if err := o.dirEntry.removeFile(ctx, base); err != nil {
+		return err
 	}
-	delete(files, path.Base(o.path))
 	return o.dirEntry.write(ctx)
 }
 
@@ -274,6 +358,22 @@ func (o object) MimeType(ctx context.Context) string {
 		return mimeTyper.MimeType(ctx)
 	}
 	return ""
+}
+
+// GetTier returns the tier of the base object.
+func (o object) GetTier() string {
+	if getTierer, ok := o.obj.(fs.GetTierer); ok {
+		return getTierer.GetTier()
+	}
+	return ""
+}
+
+// SetTier sets the tier of the base object.
+func (o object) SetTier(tier string) error {
+	if setTierer, ok := o.obj.(fs.SetTierer); ok {
+		return setTierer.SetTier(tier)
+	}
+	return fs.ErrorNotImplemented
 }
 
 // fakeObjInfo is a ObjectInfo with its path faked to be used in

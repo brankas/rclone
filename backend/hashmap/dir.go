@@ -24,7 +24,46 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if !ok {
 		return nil, fs.ErrorDirNotFound
 	}
+	return f.list(ctx, entry)
+}
 
+// ListR lists the objects and directories of the Fs starting from dir
+// recursively into out.
+//
+// This should return ErrDirNotFound if the directory isn't found.
+//
+// It should call callback for each tranche of entries read. These need not be
+// returned in any particular order.  If callback returns an error then the
+// listing will stop immediately.
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	dir = path.Join(f.root, dir)
+	entry, ok := f.dirMap.Path[dir]
+	if !ok {
+		return fs.ErrorDirNotFound
+	}
+	var recurse func(e *dirEntry) error
+	recurse = func(e *dirEntry) error {
+		entries, err := f.list(ctx, e)
+		if err != nil {
+			return err
+		}
+		if err := callback(entries); err != nil {
+			return err
+		}
+		for _, child := range e.Children {
+			if err := recurse(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return recurse(entry)
+}
+
+// list lists all the files in the given directory entry in a format rclone
+// recognizes.
+func (f *Fs) list(ctx context.Context, entry *dirEntry) (fs.DirEntries, error) {
+	// List directories and files.
 	subdirNames := make(map[string]*dirEntry, len(entry.Children))
 	for _, child := range entry.Children {
 		subdirNames[child.Hash] = child
@@ -37,7 +76,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	for path := range files {
 		subpathNames[path] = struct{}{}
 	}
-
+	// Create fs.DirEntry.
 	entries := make(fs.DirEntries, 0, len(entry.Children)+len(files))
 	if len(subdirNames) > 0 {
 		// Locate the entries from base.
@@ -64,30 +103,21 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		})
 	}
 	for k := range subpathNames {
-		filePath := path.Join(dir, k)
+		filePath := path.Join(entry.Path, k)
+		// Make path relative to root of FS.
+		filePath = strings.TrimPrefix(filePath, f.root)
+		filePath = strings.TrimPrefix(filePath, "/")
 		obj, err := f.NewObject(ctx, filePath)
 		if err != nil {
-			return nil, fmt.Errorf("error fetching object %q: %w", filePath, err)
+			// Don't fail listing due to one file. Just report a warning and
+			// drop the file.
+			fs.LogPrintf(fs.LogLevelWarning, obj, "error fetching object %q: %v", filePath, err)
+			continue
 		}
 		entries = append(entries, obj)
 	}
 	return entries, nil
 }
-
-// ListR lists the objects and directories of the Fs starting
-// from dir recursively into out.
-//
-// This should return ErrDirNotFound if the directory isn't
-// found.
-//
-// It should call callback for each tranche of entries read.
-// These need not be returned in any particular order.  If
-// callback returns an error then the listing will stop
-// immediately.
-// TODO:
-// func (f *Fs)	ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
-//
-// }
 
 // Mkdir makes the specified directory. It should not return an error if it
 // already exists.
@@ -101,9 +131,11 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	}
 	f.dirMap.newDirEntry(dir)
 	entry := f.dirMap.Path[dir]
-	err := f.base.Mkdir(ctx, entry.Hash)
-	if err != nil {
-		return err
+	if f.base.Features().CanHaveEmptyDirectories {
+		err := f.base.Mkdir(ctx, entry.Hash)
+		if err != nil {
+			return err
+		}
 	}
 	return f.dirMap.write(ctx)
 }
@@ -177,8 +209,85 @@ func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType)
 
 // DirMove moves the specified directory from srcRemote to dstRemote after
 // mapping both remotes.
-// func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-// }
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	do := f.base.Features().DirMove
+	if do == nil {
+		return fs.ErrorCantDirMove
+	}
+	srcFs := src.(*Fs)
+	srcRemote = path.Join(srcFs.root, srcRemote)
+	dstRemote = path.Join(f.root, dstRemote)
+	srcEntry, ok := srcFs.dirMap.Path[srcRemote]
+	if !ok {
+		return fs.ErrorDirNotFound
+	}
+	if _, ok := f.dirMap.Path[dstRemote]; ok {
+		return fs.ErrorDirExists
+	}
+	var recurse func(entry *dirEntry) error
+	recurse = func(entry *dirEntry) error {
+		// Process children first to be sure parent directories always exist.
+		for _, child := range entry.Children {
+			if err := recurse(child); err != nil {
+				return err
+			}
+		}
+		// Move the directory from the source to the target.
+		srcRelative := strings.TrimPrefix(entry.Path, srcRemote)
+		srcRelative = strings.TrimPrefix(srcRelative, "/")
+		dstLocation := path.Join(dstRemote, srcRelative)
+		srcHash := srcFs.hasher(entry.Path)
+		dstHash := f.hasher(dstLocation)
+		if err := do(ctx, srcFs.base, srcHash, dstHash); err != nil {
+			return err
+		}
+		// Modify the directory maps.
+		f.dirMap.newDirEntry(dstLocation)
+		srcFs.dirMap.removeEntry(entry.Path)
+		// Rewrite the name files.
+		return f.rewriteNameFiles(ctx, dstLocation)
+	}
+	recurseErr := recurse(srcEntry)
+	if err := f.dirMap.write(ctx); err != nil {
+		return err
+	}
+	if err := srcFs.dirMap.write(ctx); err != nil {
+		return err
+	}
+	return recurseErr
+}
+
+// rewriteNameFiles rewrites the name files in the specified directory.
+// dstLocation is the absolute location. It does not write name files
+// recursively.
+func (f *Fs) rewriteNameFiles(ctx context.Context, dstLocation string) error {
+	entry := f.dirMap.Path[dstLocation]
+	// Fetch list of files to rewrite name files.
+	files, err := entry.Files(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot rewrite name files with invalid map file: %w", err)
+	}
+	// Rewrite name files to fit new path.
+	for fileName, hash := range files {
+		obj, err := f.base.NewObject(ctx, path.Join(entry.Hash, hash, "name"))
+		if err != nil {
+			return fmt.Errorf("cannot find name file to delete: %w", err)
+		}
+		if err := obj.Remove(ctx); err != nil {
+			return fmt.Errorf("cannot delete name file: %w", err)
+		}
+		fileDst := path.Join(dstLocation, fileName)
+		objInfo := fakeObjInfo{
+			remote: path.Join(entry.Hash, hash, "name"),
+			fs:     f,
+			size:   int64(len(fileDst) + 1),
+		}
+		if _, err := f.base.Put(ctx, strings.NewReader(fileDst+"\n"), objInfo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // Purge purges all files in the directory specified by recursively going into
 // directories and invoking Purge on all subdirectories.

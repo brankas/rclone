@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 	"time"
 
@@ -234,16 +235,73 @@ func (f *Fs) SetWrapper(wrapper fs.Fs) {
 	f.wrapper = wrapper
 }
 
+// DirCacheFlush flushes the file listing cache in the Fs. It is used for
+// testing purposes.
+func (f *Fs) DirCacheFlush() {
+	for _, v := range f.dirMap.Path {
+		v.files = nil
+	}
+}
+
+// Disconnect disconnects the current user in the base Fs.
+func (f *Fs) Disconnect(ctx context.Context) error {
+	do := f.base.Features().Disconnect
+	if do == nil {
+		return nil
+	}
+	return do(ctx)
+}
+
+// PublicLink creates a public link to the remote path (usually readable by
+// anyone). It is only meaningful for files because of the way directories are
+// mapped.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	do := f.base.Features().PublicLink
+	if do == nil {
+		return "", fs.ErrorNotImplemented
+	}
+	base := path.Base(remote)
+	entry, fileHash, ok := f.toHash(remote)
+	if !ok {
+		return "", fs.ErrorDirNotFound
+	}
+	files, err := entry.Files(ctx)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := files[base]; !ok {
+		return "", fs.ErrorObjectNotFound
+	}
+	return do(ctx, path.Join(entry.Hash, fileHash, "data"), expire, unlink)
+}
+
+// UserInfo returns the user info of the base Fs.
+func (f *Fs) UserInfo(ctx context.Context) (map[string]string, error) {
+	do := f.base.Features().UserInfo
+	if do == nil {
+		return nil, fs.ErrorNotImplemented
+	}
+	return do(ctx)
+}
+
 // Check that interfaces are implemented.
 var (
-	_ fs.Abouter        = (*Fs)(nil)
-	_ fs.ChangeNotifier = (*Fs)(nil)
-	_ fs.CleanUpper     = (*Fs)(nil)
-	_ fs.Copier         = (*Fs)(nil)
-	_ fs.Purger         = (*Fs)(nil)
-	_ fs.PutStreamer    = (*Fs)(nil)
-	_ fs.PutUncheckeder = (*Fs)(nil)
-	_ fs.Shutdowner     = (*Fs)(nil)
-	_ fs.UnWrapper      = (*Fs)(nil)
-	_ fs.Wrapper        = (*Fs)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
+	_ fs.ChangeNotifier  = (*Fs)(nil)
+	_ fs.CleanUpper      = (*Fs)(nil)
+	_ fs.Copier          = (*Fs)(nil)
+	_ fs.DirCacheFlusher = (*Fs)(nil)
+	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.Disconnecter    = (*Fs)(nil)
+	_ fs.ListRer         = (*Fs)(nil)
+	_ fs.Mover           = (*Fs)(nil)
+	_ fs.OpenWriterAter  = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
+	_ fs.Purger          = (*Fs)(nil)
+	_ fs.PutStreamer     = (*Fs)(nil)
+	_ fs.PutUncheckeder  = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
+	_ fs.UnWrapper       = (*Fs)(nil)
+	_ fs.UserInfoer      = (*Fs)(nil)
+	_ fs.Wrapper         = (*Fs)(nil)
 )

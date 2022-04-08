@@ -41,23 +41,29 @@ func loadDirectoryMap(fs *Fs, in io.Reader) (*dirMap, error) {
 	return dMap, nil
 }
 
-// Files returns a map mapping from the filename to the hashed path.
-func (d *dirEntry) Files(ctx context.Context) (map[string]string, error) {
+// fillFiles fills the file list from the map file stored in the base.
+func (d *dirEntry) fillFiles(ctx context.Context) (err error) {
 	if d.files != nil {
-		return d.files, nil
+		return nil
 	}
+	defer func() {
+		// If there is an error, do not set files.
+		if err != nil {
+			d.files = nil
+		}
+	}()
 	d.files = make(map[string]string)
 	obj, err := d.fs.base.NewObject(ctx, path.Join(d.Hash, "map"))
 	switch {
 	case errors.Is(err, fs.ErrorObjectNotFound):
 		// Just create a new directory if it is not present.
-		return d.files, nil
+		return nil
 	case err != nil:
-		return nil, err
+		return err
 	}
 	in, err := obj.Open(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error opening map file: %w", err)
+		return fmt.Errorf("error opening map file: %w", err)
 	}
 	defer in.Close()
 	r := bufio.NewReader(in)
@@ -67,7 +73,7 @@ func (d *dirEntry) Files(ctx context.Context) (map[string]string, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("error reading map file entry: %w", err)
+			return fmt.Errorf("error reading map file entry: %w", err)
 		}
 		entry = strings.TrimSuffix(entry, "\n")
 		if entry == "" {
@@ -75,21 +81,46 @@ func (d *dirEntry) Files(ctx context.Context) (map[string]string, error) {
 		}
 		split := strings.SplitN(entry, " ", 2)
 		if len(split) < 2 {
-			return nil, fmt.Errorf("malformed map file, refusing to load: invalid entry %q", entry)
+			return fmt.Errorf("malformed map file, refusing to load: invalid entry %q", entry)
 		}
 		d.files[split[1]] = split[0]
+	}
+	return nil
+}
+
+// Files returns a map mapping from the filename to the hashed path.
+func (d *dirEntry) Files(ctx context.Context) (map[string]string, error) {
+	if err := d.fillFiles(ctx); err != nil {
+		return nil, err
 	}
 	return d.files, nil
 }
 
+// addFile adds the specified file to the directory entry.
+func (d *dirEntry) addFile(ctx context.Context, file, hash string) error {
+	if err := d.fillFiles(ctx); err != nil {
+		return fmt.Errorf("refusing to modify map file in bad state: %w", err)
+	}
+	d.files[file] = hash
+	return nil
+}
+
+// removeFile deletes the specified file from the directory entry.
+func (d *dirEntry) removeFile(ctx context.Context, file string) error {
+	if err := d.fillFiles(ctx); err != nil {
+		return fmt.Errorf("refusing to modify map file in bad state: %w", err)
+	}
+	delete(d.files, file)
+	return nil
+}
+
 func (d *dirEntry) write(ctx context.Context) error {
-	files, err := d.Files(ctx)
-	if err != nil {
-		return fmt.Errorf("error fetching original list of files: %w", err)
+	if d.files == nil {
+		return fmt.Errorf("map file is not loaded")
 	}
 	// Sort the paths to make the file deterministic.
-	fileNames := make([]string, 0, len(files))
-	for f := range files {
+	fileNames := make([]string, 0, len(d.files))
+	for f := range d.files {
 		fileNames = append(fileNames, f)
 	}
 	sort.Strings(fileNames)
@@ -102,12 +133,12 @@ func (d *dirEntry) write(ctx context.Context) error {
 	}
 	go func() {
 		for _, fileName := range fileNames {
-			hash := files[fileName]
+			hash := d.files[fileName]
 			pw.Write([]byte(hash + " " + fileName + "\n"))
 		}
 		pw.Close()
 	}()
-	_, err = d.fs.base.Put(ctx, pr, objInfo)
+	_, err := d.fs.base.Put(ctx, pr, objInfo)
 	return err
 }
 
@@ -160,6 +191,11 @@ func newDirMap(f *Fs) *dirMap {
 // newDirEntry creates an entry of the directory inside the map. It creates
 // parent directory automatically if they do not exist.
 func (d dirMap) newDirEntry(overlayPath string) {
+	if _, ok := d.Path[overlayPath]; ok {
+		// Do nothing. The directory is already created.
+		// This may happen in DirMove where the children are moved first.
+		return
+	}
 	var parent *dirEntry
 	if overlayPath != "" {
 		var ok bool
@@ -195,12 +231,18 @@ func (d dirMap) removeEntry(path string) {
 	if entry.Parent == nil {
 		panic("cannot remove root directory")
 	}
-	var idx int
+	idx := -1
 	for k, v := range entry.Parent.Children {
 		if v == entry {
 			idx = k
 			break
 		}
+	}
+	if idx == -1 {
+		panic(fmt.Sprintf(
+			"inconsistent internal tree: cannot find index of %q in %q (%v)",
+			path, entry.Parent.Path, entry.Parent.Children,
+		))
 	}
 	entry.Parent.Children = append(entry.Parent.Children[:idx], entry.Parent.Children[idx+1:]...)
 	delete(d.Path, path)
